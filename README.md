@@ -13,18 +13,22 @@ Reproxy is a simple edge HTTP(s) server / reverse proxy supporting various provi
 - Consul Catalog provider with discovery by service tags
 - Support of multiple (virtual) hosts
 - Optional traffic compression
-- User-defined limits and timeouts
+- User-defined size limits and timeouts
 - Single binary distribution
 - Docker container distribution
 - Built-in static assets server with optional "SPA friendly" mode
-- Support for redirect rules  
+- Support for redirect rules 
+- Optional limiter for the overall activity as well as for user's activity   
 - Live health check and fail-over/load-balancing  
 - Management server with routes info and prometheus metrics
 - Plugins support via RPC to implement custom functionality
 - Optional logging with both Apache Log Format, and simplified stdout reports.
 ---
+<div align="center">
 
 [![build](https://github.com/umputun/reproxy/actions/workflows/ci.yml/badge.svg)](https://github.com/umputun/reproxy/actions/workflows/ci.yml)&nbsp;[![Coverage Status](https://coveralls.io/repos/github/umputun/reproxy/badge.svg?branch=master)](https://coveralls.io/github/umputun/reproxy?branch=master)&nbsp;[![Go Report Card](https://goreportcard.com/badge/github.com/umputun/reproxy)](https://goreportcard.com/report/github.com/umputun/reproxy)&nbsp;[![Docker Automated build](https://img.shields.io/docker/automated/jrottenberg/ffmpeg.svg)](https://hub.docker.com/repository/docker/umputun/reproxy)
+
+</div>
 
 Server (host) can be set as FQDN, i.e. `s.example.com` or `*` (catch all). Requested url can be regex, for example `^/api/(.*)` and destination url may have regex matched groups in, i.e. `http://d.example.com:8080/$1`. For the example above `http://s.example.com/api/something?foo=bar` will be proxied to `http://d.example.com:8080/something?foo=bar`.
 
@@ -33,8 +37,11 @@ For convenience, requests with the trailing `/` and without regex groups expande
 Both HTTP and HTTPS supported. For HTTPS, static certificate can be used as well as automated ACME (Let's Encrypt) certificates. Optional assets server can be used to serve static files. Starting reproxy requires at least one provider defined. The rest of parameters are strictly optional and have sane default.
 
 Examples:
+
  - with a static provider: `reproxy --static.enabled --static.rule="example.com/api/(.*),https://api.example.com/$1"`
  - with an automatic docker discovery: `reproxy --docker.enabled --docker.auto`
+ - as a docker container `docker up -p 80:8080 umputun/reproxy --docker.enabled --docker.auto`  
+ - with automatic SSL `docker up -p 80:8080 -p 443:8443 umputun/reproxy --docker.enabled --docker.auto --ssl.type=auto --ssl.fqdn=example.com`  
 
 ## Install
 
@@ -85,7 +92,7 @@ This is a dynamic provider and file change will be applied automatically.
 
 ### Docker provider
 
-Docker provider supports a fully automatic discovery (with `--docker.auto`) with no extra configuration needed.By default it redirects all requests like `http://<container_name>:<container_port>/(.*)` to the internal IP of the given container and the exposed port. Only active (running) containers will be detected.
+Docker provider supports a fully automatic discovery (with `--docker.auto`) with no extra configuration needed. By default it redirects all requests like `http://<container_name>:<container_port>/(.*)` to the internal IP of the given container and the exposed port. Only active (running) containers will be detected.
 
 This default can be changed with labels:
 
@@ -175,6 +182,35 @@ There are two ways to set cache duration:
 1. A single value for all static assets. This is as simple as `--assets.cache=48h`.
 2. Custom duration for different mime types. It should include two parts - the default value and the pairs of mime:duration. In command line this looks like multiple `--assets.cache` options, i.e. `--assets.cache=48h --assets.cache=text/html:24h --assets.cache=image/png:2h`. Environment values should be comma-separated, i.e. `ASSETS_CACHE=48h,text/html:24h,image/png:2h`
 
+## Using reproxy as a base image
+
+Serving purely static content is one of the popular use cases. Usually this used for the separate frontend container providing UI only. With the assets server such a container is almost trivial to make. This is an example from the container serving [reproxy.io](http://reproxy.io)
+
+```docker
+FROM node:16-alpine as build
+
+WORKDIR /build
+COPY site/ /build
+COPY README.md /build/src/index.md
+
+RUN yarn --frozen-lockfile
+RUN yarn build
+RUN	ls -la /build/public
+
+FROM ghcr.io/umputun/reproxy
+COPY --from=build /build/public /srv/site
+EXPOSE 8080
+USER app
+ENTRYPOINT ["/srv/reproxy", "--assets.location=/srv/site"]
+```
+All it needs is to copy stastic assets to some location and passing this location as `"--assets.location` to reproxy entrypoint.
+
+## SPA-friendly mode
+
+Some SPA applications counts on proxy to handle 404 on static asset in a special way, by redirecting it to "/index.html". This is similar to nginx's `try_files $uri $uri/ …` directive and, apparently, this functionality somewhat important for the modern web apps.
+
+This mode is off by default and can be turned on by setting `--assets.spa` or `ASSETS_SPA=true` env.
+
 ## Redirects 
 
 By default reproxy treats destination as a proxy location, i.e. it invokes http call internally and returns response back to the client. However by prefixing destination url with `@code` this behaviour can be changed to a permanent (status code 301) or temporary (status code 302) redirects. I.e. destination set to `@301 https://example.com/something` with cause permanent http redirect to `Location: https://example.com/something`
@@ -236,6 +272,12 @@ _see also [examples/metrics](https://github.com/umputun/reproxy/tree/master/exam
 
 Reproxy returns 502 (Bad Gateway) error in case if request doesn't match to any provided routes and assets. In case if some unexpected, internal error happened it returns 500. By default reproxy renders the simplest text version of the error - "Server error". Setting `--error.enabled` turns on the default html error message and with `--error.template` user may set any custom html template file for the error rendering. The template has two vars: `{{.ErrCode}}` and `{{.ErrMessage}}`. For example this template `oh my! {{.ErrCode}} - {{.ErrMessage}}` will be rendered to `oh my! 502 - Bad Gateway`
 
+## Throttling 
+
+Reproxy allows to define system level max req/sec value for the overall system activity as well as per user. 0 values (default) treated as unlimited.
+
+User activity limited for both matched and unmatched routes. All unmatched routes considered as a "single destination group" and get a common limiter which is `rate*3`. It means if 10 (req/sec) defined with `--throttle.user=10` the end user will be able to perform up to 30 request pers second for either static assets or unmatched routes. For matched routes this limiter maintained per destination (route), i.e. request proxied to s1.example.com/api will allow 10 r/s and the request proxied to s2.example.com will allow another 10 r/s.
+
 ## Plugins support
 
 The core functionality of reproxy can be extended with external plugins. Each plugin is an independent process/container implementing [rpc server](https://golang.org/pkg/net/rpc/). Plugins registered with reproxy conductor and added to the chain of the middlewares. Each plugin receives request with the original url, headers and all matching route info and responds with the headers and the status code. Any status code >= 400 treated as an error response and terminates flow immediately with the proxy error. There are two types of headers plugins can set:
@@ -277,8 +319,8 @@ This is the list of all options supporting multiple elements:
   -l, --listen=                     listen on host:port (default: 0.0.0.0:8080/8443 under docker, 127.0.0.1:80/443 without) [$LISTEN]
   -m, --max=                        max request size (default: 64K) [$MAX_SIZE]
   -g, --gzip                        enable gz compression [$GZIP]
-  -x, --header=                     proxy headers [$HEADER]
-      --lb-type=[random|failover]   load balancer type (default: random) [$LB_TYPE]  
+  -x, --header=                     proxy headers
+      --lb-type=[random|failover]   load balancer type (default: random) [$LB_TYPE]
       --signature                   enable reproxy signature headers [$SIGNATURE]
       --dbg                         debug mode [$DEBUG]
 
@@ -294,13 +336,14 @@ ssl:
 assets:
   -a, --assets.location=            assets location [$ASSETS_LOCATION]
       --assets.root=                assets web root (default: /) [$ASSETS_ROOT]
+      --assets.spa                  spa treatment for assets [$ASSETS_SPA]
       --assets.cache=               cache duration for assets [$ASSETS_CACHE]
 
 logger:
       --logger.stdout               enable stdout logging [$LOGGER_STDOUT]
       --logger.enabled              enable access and error rotated logs [$LOGGER_ENABLED]
       --logger.file=                location of access log (default: access.log) [$LOGGER_FILE]
-      --logger.max-size=            maximum size in megabytes before it gets rotated (default: 100M) [$LOGGER_MAX_SIZE]
+      --logger.max-size=            maximum size before it gets rotated (default: 100M) [$LOGGER_MAX_SIZE]
       --logger.max-backups=         maximum number of old log files to retain (default: 10) [$LOGGER_MAX_BACKUPS]
 
 docker:
@@ -349,11 +392,17 @@ health-check:
       --health-check.enabled        enable automatic health-check [$HEALTH_CHECK_ENABLED]
       --health-check.interval=      automatic health-check interval (default: 300s) [$HEALTH_CHECK_INTERVAL]
 
+throttle:
+      --throttle.system=            throttle overall activity' (default: 0) [$THROTTLE_SYSTEM]
+      --throttle.user=              limit req/sec per user and per proxy destination (default: 0) [$THROTTLE_USER]
+
+plugin:
+      --plugin.enabled              enable plugin support [$PLUGIN_ENABLED]
+      --plugin.listen=              registration listen on host:port (default: 127.0.0.1:8081) [$PLUGIN_LISTEN]
 
 Help Options:
   -h, --help                        Show this help message
 ```
-
 
 ## Status
 

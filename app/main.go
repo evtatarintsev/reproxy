@@ -33,8 +33,9 @@ var opts struct {
 	Listen       string   `short:"l" long:"listen" env:"LISTEN" description:"listen on host:port (default: 0.0.0.0:8080/8443 under docker, 127.0.0.1:80/443 without)"`
 	MaxSize      string   `short:"m" long:"max" env:"MAX_SIZE" default:"64K" description:"max request size"`
 	GzipEnabled  bool     `short:"g" long:"gzip" env:"GZIP" description:"enable gz compression"`
-	ProxyHeaders []string `short:"x" long:"header" env:"HEADER" description:"proxy headers" env-delim:","`
-	LBType       string   `long:"lb-type" env:"LB_TYPE" description:"load balancer type" choice:"random" choice:"failover" default:"random"` //nolint
+	ProxyHeaders []string `short:"x" long:"header" description:"proxy headers"` // env HEADER split in code to allow , inside ""
+
+	LBType string `long:"lb-type" env:"LB_TYPE" description:"load balancer type" choice:"random" choice:"failover" default:"random"` //nolint
 
 	SSL struct {
 		Type          string   `long:"type" env:"TYPE" description:"ssl (auto) support" choice:"none" choice:"static" choice:"auto" default:"none"` //nolint
@@ -114,6 +115,11 @@ var opts struct {
 		Enabled  bool          `long:"enabled" env:"ENABLED" description:"enable automatic health-check"`
 		Interval time.Duration `long:"interval" env:"INTERVAL" default:"300s" description:"automatic health-check interval"`
 	} `group:"health-check" namespace:"health-check" env-namespace:"HEALTH_CHECK"`
+
+	Throttle struct {
+		System int `long:"system" env:"SYSTEM" default:"0" description:"throttle overall activity'"`
+		User   int `long:"user" env:"USER"  default:"0" description:"limit req/sec per user and per proxy destination"`
+	} `group:"throttle" namespace:"throttle" env-namespace:"THROTTLE"`
 
 	Plugin struct {
 		Enabled bool   `long:"enabled" env:"ENABLED" description:"enable plugin support"`
@@ -216,6 +222,11 @@ func run() error {
 		return fmt.Errorf("failed to convert MaxSize: %w", err)
 	}
 
+	proxyHeaders := opts.ProxyHeaders
+	if len(proxyHeaders) == 0 {
+		proxyHeaders = splitAtCommas(os.Getenv("HEADER")) // env value may have comma inside "", parsed separately
+	}
+
 	px := &proxy.Http{
 		Version:        revision,
 		Matcher:        svc,
@@ -227,7 +238,7 @@ func run() error {
 		CacheControl:   cacheControl,
 		GzEnabled:      opts.GzipEnabled,
 		SSLConfig:      sslConfig,
-		ProxyHeaders:   opts.ProxyHeaders,
+		ProxyHeaders:   proxyHeaders,
 		AccessLog:      accessLog,
 		StdOutEnabled:  opts.Logger.StdOut,
 		Signature:      opts.Signature,
@@ -246,6 +257,8 @@ func run() error {
 		Metrics:         makeMetrics(ctx, svc),
 		Reporter:        errReporter,
 		PluginConductor: makePluginConductor(ctx),
+		ThrottleSystem:  opts.Throttle.System * 3,
+		ThottleUser:     opts.Throttle.User,
 	}
 
 	err = px.Run(ctx)
@@ -470,6 +483,49 @@ func sizeParse(inp string) (uint64, error) {
 		}
 	}
 	return strconv.ParseUint(inp, 10, 64)
+}
+
+// splitAtCommas split s at commas, ignoring commas in strings.
+// Eliminate leading and trailing dbl quotes in each element only if both presented
+// based on https://stackoverflow.com/a/59318708
+func splitAtCommas(s string) []string {
+
+	cleanup := func(s string) string {
+		if s == "" {
+			return s
+		}
+		res := strings.TrimSpace(s)
+		if res[0] == '"' && res[len(res)-1] == '"' {
+			res = strings.TrimPrefix(res, `"`)
+			res = strings.TrimSuffix(res, `"`)
+		}
+		return res
+	}
+
+	var res []string
+	var beg int
+	var inString bool
+
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' && !inString {
+			res = append(res, cleanup(s[beg:i]))
+			beg = i + 1
+			continue
+		}
+
+		if s[i] == '"' {
+			if !inString {
+				inString = true
+			} else if i > 0 && s[i-1] != '\\' { // also allow \"
+				inString = false
+			}
+		}
+	}
+	res = append(res, cleanup(s[beg:]))
+	if len(res) == 1 && res[0] == "" {
+		return []string{}
+	}
+	return res
 }
 
 type nopWriteCloser struct{ io.Writer }
